@@ -376,6 +376,17 @@ func parseRequirements(description string) Requirements {
 func buildCELExpressions(req Requirements) []string {
 	var expressions []string
 
+	// Production environment: Check all common label combinations
+	// Supports: environment=production, environment=prod, env=production, env=prod
+	if req.Environment == "production" {
+		expressions = append(expressions,
+			`managedCluster.metadata.labels["environment"] == "production" || managedCluster.metadata.labels["environment"] == "prod" || managedCluster.metadata.labels["env"] == "production" || managedCluster.metadata.labels["env"] == "prod"`)
+	} else if req.Environment != "" {
+		// For non-production environments, check both "environment" and "env" keys
+		expressions = append(expressions,
+			fmt.Sprintf(`managedCluster.metadata.labels["environment"] == "%s" || managedCluster.metadata.labels["env"] == "%s"`, req.Environment, req.Environment))
+	}
+
 	// OpenShift version: !semver(...).isLessThan(...) for >= comparison
 	if req.MinVersion != "" {
 		expressions = append(expressions,
@@ -442,13 +453,8 @@ func buildPlacementSpec(req Requirements) clusterv1beta1.PlacementSpec {
 func buildLabelRequirements(req Requirements) []metav1.LabelSelectorRequirement {
 	var reqs []metav1.LabelSelectorRequirement
 
-	if req.Environment != "" {
-		reqs = append(reqs, metav1.LabelSelectorRequirement{
-			Key:      "environment",
-			Operator: metav1.LabelSelectorOpIn,
-			Values:   []string{req.Environment},
-		})
-	}
+	// Environment is now handled via CEL expressions to support multiple label key variations
+	// (environment=production, env=prod, etc.)
 
 	if req.CloudProvider != "" {
 		reqs = append(reqs, metav1.LabelSelectorRequirement{
