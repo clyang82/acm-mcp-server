@@ -10,10 +10,14 @@ import (
 
 	"github.com/google/cel-go/cel"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	clusterclientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
+	clusterlisterv1beta1 "open-cluster-management.io/api/client/cluster/listers/cluster/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	clusterv1beta1 "open-cluster-management.io/api/cluster/v1beta1"
+	"open-cluster-management.io/ocm/pkg/placement/controllers/metrics"
 	"open-cluster-management.io/ocm/pkg/placement/controllers/scheduling"
 	"open-cluster-management.io/ocm/pkg/placement/helpers"
 	"sigs.k8s.io/yaml"
@@ -163,6 +167,29 @@ func (h *Handler) parsePlacementParams(params DryRunPlacementParams) (*clusterv1
 	return nil, fmt.Errorf("either placementYAML or description must be provided")
 }
 
+// emptyPlacementDecisionLister implements PlacementDecisionLister interface with empty results
+// This is used for dry run to avoid nil pointer errors in plugins
+type emptyPlacementDecisionLister struct{}
+
+func (e *emptyPlacementDecisionLister) List(selector labels.Selector) (ret []*clusterv1beta1.PlacementDecision, err error) {
+	return []*clusterv1beta1.PlacementDecision{}, nil
+}
+
+func (e *emptyPlacementDecisionLister) PlacementDecisions(namespace string) clusterlisterv1beta1.PlacementDecisionNamespaceLister {
+	return &emptyPlacementDecisionNamespaceLister{}
+}
+
+// emptyPlacementDecisionNamespaceLister implements PlacementDecisionNamespaceLister interface with empty results
+type emptyPlacementDecisionNamespaceLister struct{}
+
+func (e *emptyPlacementDecisionNamespaceLister) List(selector labels.Selector) (ret []*clusterv1beta1.PlacementDecision, err error) {
+	return []*clusterv1beta1.PlacementDecision{}, nil
+}
+
+func (e *emptyPlacementDecisionNamespaceLister) Get(name string) (*clusterv1beta1.PlacementDecision, error) {
+	return nil, fmt.Errorf("not found")
+}
+
 // evaluateClusters filters and scores clusters based on placement spec using OCM scheduler
 func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placement *clusterv1beta1.Placement) []ClusterDecision {
 	// Convert []clusterv1.ManagedCluster to []*clusterv1.ManagedCluster for scheduler
@@ -184,13 +211,20 @@ func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placemen
 	}
 
 	// Create scheduler handler with minimal dependencies (dry run doesn't need all components)
+	// Create a metrics recorder for the scheduler (required even for dry run)
+	metricsRecorder := metrics.NewScheduleMetrics(clock.RealClock{})
+
+	// Create empty lister to avoid nil pointer errors in plugins
+	// The taint toleration plugin requires a non-nil placementDecisionLister
+	emptyLister := &emptyPlacementDecisionLister{}
+
 	handle := scheduling.NewSchedulerHandler(
 		h.ClusterClient,
-		nil, // placementDecisionLister - not needed for dry run
-		nil, // scoreLister - not needed for dry run without AddOn prioritizers
-		nil, // clusterLister - not needed, we already have the clusters
-		nil, // eventsRecorder - not needed for dry run
-		nil, // metricsRecorder - not needed for dry run
+		emptyLister,     // Empty lister for dry run
+		nil,             // scoreLister - not needed for dry run without AddOn prioritizers
+		nil,             // clusterLister - not needed, we already have the clusters
+		nil,             // eventsRecorder - not needed for dry run
+		metricsRecorder, // metricsRecorder - required to avoid nil pointer errors
 	)
 
 	// Create the plugin scheduler (includes filters + prioritizers)
@@ -446,7 +480,8 @@ func parseRequirements(description string) Requirements {
 	}
 
 	// Parse number of clusters
-	numRegex := regexp.MustCompile(`(\d+)\s*clusters?`)
+	// Matches patterns like: "1 cluster", "1 production cluster", "select 1 cluster", etc.
+	numRegex := regexp.MustCompile(`(\d+)\s+(?:\w+\s+)*clusters?`)
 	if matches := numRegex.FindStringSubmatch(desc); len(matches) > 1 {
 		if num, err := strconv.ParseInt(matches[1], 10, 32); err == nil {
 			n := int32(num)
@@ -477,32 +512,33 @@ func buildCELExpressions(req Requirements) []string {
 
 	// Production environment: Check all common label combinations
 	// Supports: environment=production, environment=prod, env=production, env=prod
+	// Use has() to safely check if labels exist before accessing them
 	if req.Environment == "production" {
 		expressions = append(expressions,
-			`managedCluster.metadata.labels["environment"] == "production" || managedCluster.metadata.labels["environment"] == "prod" || managedCluster.metadata.labels["env"] == "production" || managedCluster.metadata.labels["env"] == "prod"`)
+			`(has(managedCluster.metadata.labels.environment) && (managedCluster.metadata.labels["environment"] == "production" || managedCluster.metadata.labels["environment"] == "prod")) || (has(managedCluster.metadata.labels.env) && (managedCluster.metadata.labels["env"] == "production" || managedCluster.metadata.labels["env"] == "prod"))`)
 	} else if req.Environment != "" {
 		// For non-production environments, check both "environment" and "env" keys
 		expressions = append(expressions,
-			fmt.Sprintf(`managedCluster.metadata.labels["environment"] == "%s" || managedCluster.metadata.labels["env"] == "%s"`, req.Environment, req.Environment))
+			fmt.Sprintf(`(has(managedCluster.metadata.labels.environment) && managedCluster.metadata.labels["environment"] == "%s") || (has(managedCluster.metadata.labels.env) && managedCluster.metadata.labels["env"] == "%s")`, req.Environment, req.Environment))
 	}
 
 	// OpenShift version: !semver(...).isLessThan(...) for >= comparison
 	if req.MinVersion != "" {
 		expressions = append(expressions,
-			fmt.Sprintf(`!semver(managedCluster.metadata.labels["openshiftVersion"]).isLessThan(semver("%s.0"))`, req.MinVersion))
+			fmt.Sprintf(`has(managedCluster.metadata.labels.openshiftVersion) && !semver(managedCluster.metadata.labels["openshiftVersion"]).isLessThan(semver("%s.0"))`, req.MinVersion))
 	}
 
 	// CPU capacity
 	if req.MinCPU != "" {
 		expressions = append(expressions,
-			fmt.Sprintf(`int(managedCluster.status.capacity.cpu) >= %s`, req.MinCPU))
+			fmt.Sprintf(`has(managedCluster.status.capacity.cpu) && int(managedCluster.status.capacity.cpu) >= %s`, req.MinCPU))
 	}
 
 	// Memory capacity (strip unit suffixes)
 	if req.MinMemory != "" {
 		memValue := strings.TrimSuffix(req.MinMemory, "Gi")
 		expressions = append(expressions,
-			fmt.Sprintf(`int(managedCluster.status.capacity.memory.replace("Gi", "").replace("Mi", "").replace("Ki", "")) >= %s`, memValue))
+			fmt.Sprintf(`has(managedCluster.status.capacity.memory) && int(managedCluster.status.capacity.memory.replace("Gi", "").replace("Mi", "").replace("Ki", "")) >= %s`, memValue))
 	}
 
 	// Disk/Storage capacity (ephemeral-storage)
@@ -524,7 +560,7 @@ func buildCELExpressions(req Requirements) []string {
 		}
 		if diskValueKi > 0 {
 			expressions = append(expressions,
-				fmt.Sprintf(`int(managedCluster.status.capacity["ephemeral-storage"].replace("Ki", "")) >= %d`, diskValueKi))
+				fmt.Sprintf(`"ephemeral-storage" in managedCluster.status.capacity && int(managedCluster.status.capacity["ephemeral-storage"].replace("Ki", "")) >= %d`, diskValueKi))
 		}
 	}
 
