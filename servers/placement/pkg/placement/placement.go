@@ -14,6 +14,7 @@ import (
 	clusterclientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	clusterv1beta1 "open-cluster-management.io/api/cluster/v1beta1"
+	"open-cluster-management.io/ocm/pkg/placement/controllers/scheduling"
 	"open-cluster-management.io/ocm/pkg/placement/helpers"
 	"sigs.k8s.io/yaml"
 )
@@ -120,16 +121,8 @@ func (h *Handler) DryRunPlacement(ctx context.Context, params DryRunPlacementPar
 		return nil, fmt.Errorf("failed to list clusters: %v", err)
 	}
 
-	// Filter and evaluate clusters
+	// Filter, score, and rank clusters using OCM scheduler
 	decisions := h.evaluateClusters(clusters.Items, placement)
-
-	// Apply numberOfClusters limit if specified
-	if placement.Spec.NumberOfClusters != nil {
-		limit := int(*placement.Spec.NumberOfClusters)
-		if len(decisions) > limit {
-			decisions = decisions[:limit]
-		}
-	}
 
 	return &DryRunPlacementResult{
 		Decisions:    decisions,
@@ -170,18 +163,85 @@ func (h *Handler) parsePlacementParams(params DryRunPlacementParams) (*clusterv1
 	return nil, fmt.Errorf("either placementYAML or description must be provided")
 }
 
-// evaluateClusters filters clusters based on placement spec
+// evaluateClusters filters and scores clusters based on placement spec using OCM scheduler
 func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placement *clusterv1beta1.Placement) []ClusterDecision {
+	// Convert []clusterv1.ManagedCluster to []*clusterv1.ManagedCluster for scheduler
+	clusterPtrs := make([]*clusterv1.ManagedCluster, 0, len(clusters))
+	for i := range clusters {
+		// Skip clusters in terminating state
+		if !clusters[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		clusterPtrs = append(clusterPtrs, &clusters[i])
+	}
+
+	// Check if placement has prioritizers configured
+	hasPrioritizers := placement.Spec.PrioritizerPolicy.Mode != "" || len(placement.Spec.PrioritizerPolicy.Configurations) > 0
+
+	// If no prioritizers and no numberOfClusters limit, use simple predicate-only evaluation for better performance
+	if !hasPrioritizers && placement.Spec.NumberOfClusters == nil {
+		return h.evaluateClustersPredicateOnly(clusterPtrs, placement)
+	}
+
+	// Create scheduler handler with minimal dependencies (dry run doesn't need all components)
+	handle := scheduling.NewSchedulerHandler(
+		h.ClusterClient,
+		nil, // placementDecisionLister - not needed for dry run
+		nil, // scoreLister - not needed for dry run without AddOn prioritizers
+		nil, // clusterLister - not needed, we already have the clusters
+		nil, // eventsRecorder - not needed for dry run
+		nil, // metricsRecorder - not needed for dry run
+	)
+
+	// Create the plugin scheduler (includes filters + prioritizers)
+	scheduler := scheduling.NewPluginScheduler(handle)
+
+	// Run the full scheduling logic
+	result, status := scheduler.Schedule(context.Background(), placement, clusterPtrs)
+	if status.IsError() {
+		klog.V(4).InfoS("Scheduler returned error, falling back to predicate-only evaluation", "error", status.Message())
+		// Fallback to predicate-only logic
+		return h.evaluateClustersPredicateOnly(clusterPtrs, placement)
+	}
+
+	// Convert scheduled decisions to ClusterDecision format with scores
+	decisions := []ClusterDecision{}
+	prioritizerScores := result.PrioritizerScores()
+
+	for _, cluster := range result.Decisions() {
+		score := prioritizerScores[cluster.Name]
+		reason := fmt.Sprintf("Score: %d", score)
+
+		// Add detailed score breakdown if available
+		if len(result.PrioritizerResults()) > 0 {
+			scoreDetails := []string{}
+			for _, pr := range result.PrioritizerResults() {
+				if clusterScore, exists := pr.Scores[cluster.Name]; exists {
+					scoreDetails = append(scoreDetails, fmt.Sprintf("%s=%d*%d", pr.Name, clusterScore, pr.Weight))
+				}
+			}
+			if len(scoreDetails) > 0 {
+				reason = fmt.Sprintf("Total score: %d (%s)", score, strings.Join(scoreDetails, ", "))
+			}
+		}
+
+		decisions = append(decisions, ClusterDecision{
+			ClusterName: cluster.Name,
+			Reason:      reason,
+		})
+	}
+
+	return decisions
+}
+
+// evaluateClustersPredicateOnly filters clusters based on predicates without scoring
+// This is used as a fallback or when no prioritizers are configured
+func (h *Handler) evaluateClustersPredicateOnly(clusters []*clusterv1.ManagedCluster, placement *clusterv1beta1.Placement) []ClusterDecision {
 	decisions := []ClusterDecision{}
 
 	for _, cluster := range clusters {
-		// Skip clusters in terminating state
-		if !cluster.DeletionTimestamp.IsZero() {
-			continue
-		}
-
 		// Check if cluster taints are tolerated
-		if tolerated, _ := isClusterTolerated(&cluster, placement.Spec.Tolerations); !tolerated {
+		if tolerated, _ := isClusterTolerated(cluster, placement.Spec.Tolerations); !tolerated {
 			continue
 		}
 
@@ -195,11 +255,19 @@ func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placemen
 		}
 
 		// Match clusters against predicates (predicates are ORed)
-		if matched, reason := h.matchClusterWithPredicates(&cluster, placement.Spec.Predicates); matched {
+		if matched, reason := h.matchClusterWithPredicates(cluster, placement.Spec.Predicates); matched {
 			decisions = append(decisions, ClusterDecision{
 				ClusterName: cluster.Name,
 				Reason:      reason,
 			})
+		}
+	}
+
+	// Apply numberOfClusters limit if specified
+	if placement.Spec.NumberOfClusters != nil {
+		limit := int(*placement.Spec.NumberOfClusters)
+		if len(decisions) > limit {
+			decisions = decisions[:limit]
 		}
 	}
 
@@ -296,11 +364,16 @@ type Requirements struct {
 	Regions          []string // e.g., ["us-east", "us-west"]
 	MinCPU           string   // e.g., "8"
 	MinMemory        string   // e.g., "16Gi"
+	MinDisk          string   // e.g., "500Gi", "1Ti"
 	MinVersion       string   // e.g., "4.16"
 	CloudProvider    string   // e.g., "AWS", "Azure", "GCP"
 	CustomLabels     map[string]string
 	CustomClaims     map[string]string
 	NumberOfClusters *int32
+	// Prioritization hints
+	PrioritizeCPU    bool // true if "highest CPU", "most CPU", "best CPU"
+	PrioritizeMemory bool // true if "highest memory", "most memory", "best memory"
+	PrioritizeBest   bool // true if "best" without specific resource
 }
 
 // parseRequirements parses natural language description into structured requirements
@@ -355,9 +428,21 @@ func parseRequirements(description string) Requirements {
 		req.MinCPU = matches[1]
 	}
 
-	memoryRegex := regexp.MustCompile(`(\d+)\s*(?:gi|gb|gib)`)
+	memoryRegex := regexp.MustCompile(`(\d+)\s*(?:gi|gb|gib)\s+memory`)
 	if matches := memoryRegex.FindStringSubmatch(desc); len(matches) > 1 {
 		req.MinMemory = matches[1] + "Gi"
+	}
+
+	// Parse disk/storage requirements (e.g., "500GB disk", "1TB storage")
+	diskRegex := regexp.MustCompile(`(\d+)\s*(?:gi|gb|gib|ti|tb|tib)\s+(?:disk|storage)`)
+	if matches := diskRegex.FindStringSubmatch(desc); len(matches) > 1 {
+		// Normalize to Gi or Ti
+		sizeStr := matches[1]
+		if strings.Contains(strings.ToLower(matches[0]), "ti") || strings.Contains(strings.ToLower(matches[0]), "tb") {
+			req.MinDisk = sizeStr + "Ti"
+		} else {
+			req.MinDisk = sizeStr + "Gi"
+		}
 	}
 
 	// Parse number of clusters
@@ -367,6 +452,20 @@ func parseRequirements(description string) Requirements {
 			n := int32(num)
 			req.NumberOfClusters = &n
 		}
+	}
+
+	// Parse prioritization keywords
+	// "highest CPU", "most CPU", "best CPU", "high CPU availability"
+	if regexp.MustCompile(`(highest|most|best|high|maximum|max).*cpu`).MatchString(desc) {
+		req.PrioritizeCPU = true
+	}
+	// "highest memory", "most memory", "best memory", "high memory availability"
+	if regexp.MustCompile(`(highest|most|best|high|maximum|max).*memory`).MatchString(desc) {
+		req.PrioritizeMemory = true
+	}
+	// "best cluster" or just "best" - prioritize both CPU and memory
+	if regexp.MustCompile(`\bbest\b`).MatchString(desc) && !req.PrioritizeCPU && !req.PrioritizeMemory {
+		req.PrioritizeBest = true
 	}
 
 	return req
@@ -404,6 +503,29 @@ func buildCELExpressions(req Requirements) []string {
 		memValue := strings.TrimSuffix(req.MinMemory, "Gi")
 		expressions = append(expressions,
 			fmt.Sprintf(`int(managedCluster.status.capacity.memory.replace("Gi", "").replace("Mi", "").replace("Ki", "")) >= %s`, memValue))
+	}
+
+	// Disk/Storage capacity (ephemeral-storage)
+	// Convert to Ki (smallest unit) for comparison
+	if req.MinDisk != "" {
+		var diskValueKi int64
+		if strings.HasSuffix(req.MinDisk, "Ti") {
+			// Convert Ti to Ki: 1Ti = 1024 * 1024 * 1024 Ki
+			tiValue := strings.TrimSuffix(req.MinDisk, "Ti")
+			if val, err := strconv.ParseInt(tiValue, 10, 64); err == nil {
+				diskValueKi = val * 1024 * 1024 * 1024
+			}
+		} else if strings.HasSuffix(req.MinDisk, "Gi") {
+			// Convert Gi to Ki: 1Gi = 1024 * 1024 Ki
+			giValue := strings.TrimSuffix(req.MinDisk, "Gi")
+			if val, err := strconv.ParseInt(giValue, 10, 64); err == nil {
+				diskValueKi = val * 1024 * 1024
+			}
+		}
+		if diskValueKi > 0 {
+			expressions = append(expressions,
+				fmt.Sprintf(`int(managedCluster.status.capacity["ephemeral-storage"].replace("Ki", "")) >= %d`, diskValueKi))
+		}
 	}
 
 	return expressions
@@ -446,7 +568,75 @@ func buildPlacementSpec(req Requirements) clusterv1beta1.PlacementSpec {
 		spec.Predicates = []clusterv1beta1.ClusterPredicate{predicate}
 	}
 
+	// Add prioritizers based on parsed keywords
+	prioritizers := buildPrioritizers(req)
+	if len(prioritizers) > 0 {
+		spec.PrioritizerPolicy = clusterv1beta1.PrioritizerPolicy{
+			Mode:           clusterv1beta1.PrioritizerPolicyModeExact,
+			Configurations: prioritizers,
+		}
+	}
+
 	return spec
+}
+
+// buildPrioritizers creates prioritizer configurations based on requirements
+func buildPrioritizers(req Requirements) []clusterv1beta1.PrioritizerConfig {
+	var configs []clusterv1beta1.PrioritizerConfig
+
+	// Determine weights based on user intent
+	cpuWeight := int32(0)
+	memoryWeight := int32(0)
+
+	if req.PrioritizeCPU {
+		// User explicitly wants highest CPU
+		cpuWeight = 8
+		memoryWeight = 3 // Lower weight for memory
+	} else if req.PrioritizeMemory {
+		// User explicitly wants highest memory
+		cpuWeight = 3   // Lower weight for CPU
+		memoryWeight = 8
+	} else if req.PrioritizeBest {
+		// User wants "best" overall - equal weights
+		cpuWeight = 5
+		memoryWeight = 5
+	}
+
+	// Add CPU prioritizer if weight > 0
+	if cpuWeight > 0 {
+		configs = append(configs, clusterv1beta1.PrioritizerConfig{
+			ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+				Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
+				BuiltIn: "ResourceAllocatableCPU",
+			},
+			Weight: cpuWeight,
+		})
+	}
+
+	// Add Memory prioritizer if weight > 0
+	if memoryWeight > 0 {
+		configs = append(configs, clusterv1beta1.PrioritizerConfig{
+			ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+				Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
+				BuiltIn: "ResourceAllocatableMemory",
+			},
+			Weight: memoryWeight,
+		})
+	}
+
+	// Add Steady prioritizer if any resource prioritizers were added
+	// This helps maintain stable placement decisions
+	if len(configs) > 0 {
+		configs = append(configs, clusterv1beta1.PrioritizerConfig{
+			ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+				Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
+				BuiltIn: "Steady",
+			},
+			Weight: 2,
+		})
+	}
+
+	return configs
 }
 
 // buildLabelRequirements creates label selector requirements

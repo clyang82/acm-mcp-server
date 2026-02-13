@@ -1,12 +1,9 @@
-# Deploying OCM Cluster MCP Server to Kubernetes
+# Deploying Placement MCP Server to Kubernetes
 
-This guide explains how to deploy the OCM Cluster MCP Server as a pod in your OCM hub cluster.
+This guide explains how to deploy the Placement MCP Server as a pod in your ACM hub cluster.
 
 ## Prerequisites
 
-- Access to an OCM hub cluster with `kubectl` configured
-- Docker or Podman installed for building the container image
-- Access to a container registry (e.g., quay.io, docker.io)
 - The `open-cluster-management` namespace exists in your cluster
 
 ## Step 1: Build the Container Image
@@ -67,7 +64,3 @@ kubectl logs -n open-cluster-management -l app=placement-mcp
 # Describe the deployment
 kubectl describe deployment placement-mcp -n open-cluster-management
 ```
-
-## Step 6: Install the MCP Server
-
-

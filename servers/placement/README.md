@@ -1,273 +1,83 @@
-# OCM Cluster MCP Server
+# Placement MCP Server
 
-A Model Context Protocol (MCP) server for listing and querying Open Cluster Management (OCM) managed clusters with label-based filtering.
+A Model Context Protocol (MCP) server for Open Cluster Management that enables AI-powered placement generation and cluster discovery.
 
 ## Features
 
-- **List Clusters**: List all managed clusters with optional label filtering
-- **Get Cluster**: Retrieve detailed information about a specific cluster
-- **Label Filtering**: Filter clusters by labels (e.g., region, environment, etc.)
-- **Cluster Information**: Returns cluster metadata, status, capacity, and claims
+- **AI-Powered Placement Generation**: Generate OCM Placement YAML from natural language descriptions
+- **Dry Run Capability**: Preview which clusters match your placement criteria before deployment
+- **Cluster Discovery**: List and query managed clusters with label-based filtering
+- **Smart Filtering**: Filter by environment, region, cloud provider, OpenShift version, and resource capacity
 
-## Installation
+## Quick Start
 
-```bash
-# From the repository root
-cd mcp
-go build -o ocm-cluster-mcp
-```
-
-## Usage
-
-### Running the Server
-
-#### Stdio Mode (Default)
-
-The server runs in stdio mode by default, communicating via JSON-RPC over stdin/stdout:
+### Building
 
 ```bash
-# Use default kubeconfig (~/.kube/config)
-./ocm-cluster-mcp
-
-# Specify a kubeconfig file
-./ocm-cluster-mcp -kubeconfig=/path/to/kubeconfig
-
-# Enable verbose logging
-./ocm-cluster-mcp -v=2
+# Build the server
+go build -o placement-mcp ./cmd
 ```
 
-#### HTTP Mode (Streamlined)
-
-To run the server in HTTP mode for remote access:
+### Running Locally
 
 ```bash
-# Enable HTTP mode
-HTTP_MODE=true ./ocm-cluster-mcp
+# Use default kubeconfig
+./placement-mcp
 
-# Specify a custom port (default: 8080)
-HTTP_MODE=true PORT=3000 ./ocm-cluster-mcp -kubeconfig=/path/to/kubeconfig
+# Specify custom kubeconfig
+./placement-mcp -kubeconfig=/path/to/kubeconfig
 ```
 
-The HTTP server exposes the following endpoints:
-- `POST /mcp` - Main MCP endpoint for JSON-RPC requests
-- `GET /health` - Health check endpoint
+### Deployment
 
-Example HTTP request:
+For deploying to Kubernetes, see [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md).
+
+### Installing into Claude
+
+For remote MCP server deployed on Kubernetes, use token-based authentication:
+
 ```bash
-curl -X POST http://localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/list"
-  }'
+# Create a service account token
+oc create token placement-mcp -n open-cluster-management
+
+# Add the MCP server to Claude
+claude mcp add \
+  --env NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  --transport http \
+  placement \
+  https://placement-mcp-open-cluster-management.apps.YOUR-CLUSTER-DOMAIN/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
-### MCP Tools
+Replace:
+- `YOUR-CLUSTER-DOMAIN` with your OpenShift cluster domain
+- `YOUR_TOKEN` with the token from the `oc create token` command
 
-The server exposes the following tools:
+## MCP Tools
 
-#### 1. list_clusters
+The server provides four main tools:
 
-List OCM managed clusters with optional label filtering.
+1. **list_clusters** - List all managed clusters with optional label filtering
+2. **get_cluster** - Get detailed information about a specific cluster
+3. **generate_placement** - Generate Placement YAML from natural language and perform dry run
+4. **dryrun_placement** - Preview which clusters would be selected by a Placement
 
-**Parameters:**
-- `labelSelector` (optional): Kubernetes label selector string (e.g., `"environment=production,region=us-west"`)
-- `labels` (optional): Map of label key-value pairs to filter clusters
+## Example Usage
 
-**Examples:**
-
-```json
-{
-  "name": "list_clusters",
-  "arguments": {
-    "labelSelector": "environment=production"
-  }
-}
 ```
+User: "Deploy to all production clusters in us-east with OpenShift >= 4.18"
 
-```json
-{
-  "name": "list_clusters",
-  "arguments": {
-    "labels": {
-      "region": "us-west",
-      "environment": "production"
-    }
-  }
-}
+AI: [Uses generate_placement tool to create Placement YAML]
+    - Generates OCM Placement with appropriate predicates
+    - Performs dry run to show which clusters match
+    - Returns both YAML and selected clusters
 ```
-
-**Response:**
-```json
-{
-  "clusters": [
-    {
-      "name": "cluster1",
-      "labels": {
-        "region": "us-west",
-        "environment": "production",
-        "cluster.open-cluster-management.io/clusterset": "default"
-      },
-      "clusterClaims": {
-        "id.k8s.io": "cluster1-id",
-        "kubeversion.open-cluster-management.io": "v1.24.0"
-      },
-      "status": "Available",
-      "accepted": true,
-      "capacity": {
-        "cpu": "16",
-        "memory": "64Gi"
-      },
-      "allocatable": {
-        "cpu": "15",
-        "memory": "60Gi"
-      },
-      "kubeVersion": "v1.24.0"
-    }
-  ],
-  "count": 1
-}
-```
-
-#### 2. get_cluster
-
-Get details of a specific cluster by name.
-
-**Parameters:**
-- `name` (required): Name of the cluster to retrieve
-
-**Example:**
-
-```json
-{
-  "name": "get_cluster",
-  "arguments": {
-    "name": "cluster1"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "name": "cluster1",
-  "labels": {
-    "region": "us-west",
-    "environment": "production"
-  },
-  "clusterClaims": {
-    "id.k8s.io": "cluster1-id",
-    "kubeversion.open-cluster-management.io": "v1.24.0"
-  },
-  "status": "Available",
-  "accepted": true,
-  "capacity": {
-    "cpu": "16",
-    "memory": "64Gi"
-  },
-  "allocatable": {
-    "cpu": "15",
-    "memory": "60Gi"
-  },
-  "kubeVersion": "v1.24.0"
-}
-```
-
-## Common Use Cases
-
-### Filter by Environment
-
-List all production clusters:
-```json
-{
-  "name": "list_clusters",
-  "arguments": {
-    "labels": {
-      "environment": "production"
-    }
-  }
-}
-```
-
-### Filter by Region
-
-List all clusters in a specific region:
-```json
-{
-  "name": "list_clusters",
-  "arguments": {
-    "labels": {
-      "region": "us-west"
-    }
-  }
-}
-```
-
-### Multiple Label Filters
-
-List production clusters in a specific region:
-```json
-{
-  "name": "list_clusters",
-  "arguments": {
-    "labelSelector": "environment=production,region=us-west"
-  }
-}
-```
-
-### List All Clusters
-
-List all clusters without filtering:
-```json
-{
-  "name": "list_clusters",
-  "arguments": {}
-}
-```
-
-## MCP Protocol
-
-The server implements the Model Context Protocol (MCP) specification:
-
-- **Method: initialize** - Initialize the server and return server info
-- **Method: tools/list** - List available tools
-- **Method: tools/call** - Execute a tool
-
-### Transport Modes
-
-- **Stdio Mode** (default): JSON-RPC communication over stdin/stdout
-- **HTTP Mode** (streamlined): JSON-RPC over HTTP POST requests to `/mcp` endpoint
-
-## Cluster Information Fields
-
-- **name**: Cluster name
-- **labels**: Map of all cluster labels
-- **clusterClaims**: Custom cluster information (version, ID, etc.)
-- **status**: Cluster health status (Available/Unavailable/Unknown)
-- **accepted**: Whether the hub has accepted the cluster
-- **capacity**: Total cluster resources (CPU, memory)
-- **allocatable**: Available cluster resources
-- **kubeVersion**: Kubernetes version (extracted from cluster claims)
 
 ## Requirements
 
 - Go 1.25.0 or higher
 - Access to an OCM hub cluster
-- Valid kubeconfig with permissions to list ManagedCluster resources
-
-## Development
-
-```bash
-# Build from mcp directory
-go build -o ocm-cluster-mcp
-
-# Or build from repository root
-go build -o mcp/ocm-cluster-mcp ./mcp
-
-# Run with debug logging
-./ocm-cluster-mcp -v=4
-```
+- Valid kubeconfig with permissions to list/read ManagedCluster resources
 
 ## License
 

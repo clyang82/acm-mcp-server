@@ -3,7 +3,7 @@ FROM golang:1.25-bookworm AS builder
 WORKDIR /go/src/github.com/stolostron/placement-mcp
 COPY . .
 
-RUN CGO_ENABLED=0 go build -a -o placement-mcp .
+RUN CGO_ENABLED=0 go build -a -o placement-mcp ./cmd
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 ENV USER_UID=10001
