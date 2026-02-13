@@ -1,0 +1,89 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-mcp
+  namespace: open-cluster-management
+  labels:
+    app: placement-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: placement-mcp
+  template:
+    metadata:
+      labels:
+        app: placement-mcp
+    spec:
+      serviceAccountName: placement-mcp
+      containers:
+      - name: mcp-server
+        image: quay.io/clyang82/placement-mcp:latest
+        imagePullPolicy: Always
+        args:
+        - "-v=2"
+        env:
+        - name: HTTP_MODE
+          value: "true"
+        - name: PORT
+          value: "8080"
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: placement-mcp
+  namespace: open-cluster-management
+  labels:
+    app: placement-mcp
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: placement-mcp
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: placement-mcp
+  namespace: open-cluster-management
+  labels:
+    app: placement-mcp
+spec:
+  to:
+    kind: Service
+    name: placement-mcp
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
