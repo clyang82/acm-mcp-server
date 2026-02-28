@@ -14,8 +14,10 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	clusterclientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
+	clusterlisterv1alpha1 "open-cluster-management.io/api/client/cluster/listers/cluster/v1alpha1"
 	clusterlisterv1beta1 "open-cluster-management.io/api/client/cluster/listers/cluster/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
+	clusterv1alpha1 "open-cluster-management.io/api/cluster/v1alpha1"
 	clusterv1beta1 "open-cluster-management.io/api/cluster/v1beta1"
 	"open-cluster-management.io/ocm/pkg/placement/controllers/metrics"
 	"open-cluster-management.io/ocm/pkg/placement/controllers/scheduling"
@@ -49,14 +51,15 @@ func NewHandler(clusterClient clusterclientset.Interface) *Handler {
 type AddOnScoreInfo struct {
 	HasScores    bool
 	ResourceName string
-	ScoreNames   map[string]bool // Map of score names that are available
+	CPUScoreName string // Discovered CPU score name
+	MemScoreName string // Discovered memory score name
 }
 
 // detectAddOnPlacementScores checks if AddOnPlacementScore resources exist with CPU and memory scores
+// It uses pattern matching to discover score names dynamically instead of hardcoding them
 func (h *Handler) detectAddOnPlacementScores(ctx context.Context) *AddOnScoreInfo {
 	info := &AddOnScoreInfo{
-		HasScores:  false,
-		ScoreNames: make(map[string]bool),
+		HasScores: false,
 	}
 
 	// Get all managed clusters to check their namespaces for AddOnPlacementScore resources
@@ -71,39 +74,84 @@ func (h *Handler) detectAddOnPlacementScores(ctx context.Context) *AddOnScoreInf
 	// Check the first available cluster's namespace for AddOnPlacementScore
 	clusterNamespace := clusters.Items[0].Name
 
-	// Try common resource names
-	resourceNames := []string{"resource-usage-score", "default"}
+	// List all AddOnPlacementScore resources in the namespace to discover available resources
+	scores, err := h.ClusterClient.ClusterV1alpha1().AddOnPlacementScores(clusterNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.V(4).InfoS("Failed to list AddOnPlacementScores", "error", err, "namespace", clusterNamespace)
+		return info
+	}
 
-	for _, resourceName := range resourceNames {
-		score, err := h.ClusterClient.ClusterV1alpha1().AddOnPlacementScores(clusterNamespace).Get(ctx, resourceName, metav1.GetOptions{})
-		if err != nil {
-			continue
-		}
-
-		// Check if the score has the metrics we're looking for
-		hasCPU := false
-		hasMem := false
-		for _, item := range score.Status.Scores {
-			if item.Name == "cpuClusterAvailable" {
-				hasCPU = true
-				info.ScoreNames["cpuClusterAvailable"] = true
-			}
-			if item.Name == "memClusterAvailable" {
-				hasMem = true
-				info.ScoreNames["memClusterAvailable"] = true
-			}
-		}
-
-		if hasCPU && hasMem {
+	// Try to find a score resource with CPU and memory metrics
+	for _, score := range scores.Items {
+		cpuScore, memScore := findResourceScores(score.Status.Scores)
+		if cpuScore != "" && memScore != "" {
 			info.HasScores = true
-			info.ResourceName = resourceName
-			klog.V(4).InfoS("Found AddOnPlacementScore with CPU and memory scores", "resourceName", resourceName, "namespace", clusterNamespace)
+			info.ResourceName = score.Name
+			info.CPUScoreName = cpuScore
+			info.MemScoreName = memScore
+			klog.V(4).InfoS("Found AddOnPlacementScore with CPU and memory scores",
+				"resourceName", score.Name,
+				"namespace", clusterNamespace,
+				"cpuScore", cpuScore,
+				"memScore", memScore)
 			return info
 		}
 	}
 
 	klog.V(4).InfoS("No AddOnPlacementScore resources found with required scores, using BuiltIn prioritizers")
 	return info
+}
+
+// findResourceScores discovers CPU and memory score names using pattern matching
+// Returns the first matching CPU and memory score names, or empty strings if not found
+func findResourceScores(scores []clusterv1alpha1.AddOnPlacementScoreItem) (cpuScore, memScore string) {
+	// Patterns for CPU scores (in order of preference)
+	cpuPatterns := []string{
+		"cpuClusterAvailable",     // Preferred: cluster-level CPU availability
+		"cpuAvailable",            // Alternative: generic CPU availability
+		"cpu_available",           // Alternative: underscore notation
+		"cluster_cpu_available",   // Alternative: explicit cluster prefix
+	}
+
+	// Patterns for memory scores (in order of preference)
+	memPatterns := []string{
+		"memClusterAvailable",     // Preferred: cluster-level memory availability
+		"memoryClusterAvailable",  // Alternative: full "memory" word
+		"memAvailable",            // Alternative: generic memory availability
+		"memoryAvailable",         // Alternative: full "memory" word
+		"mem_available",           // Alternative: underscore notation
+		"memory_available",        // Alternative: underscore notation with full word
+		"cluster_mem_available",   // Alternative: explicit cluster prefix
+		"cluster_memory_available", // Alternative: explicit cluster prefix with full word
+	}
+
+	// Try to find CPU score
+	for _, pattern := range cpuPatterns {
+		for _, score := range scores {
+			if score.Name == pattern {
+				cpuScore = score.Name
+				break
+			}
+		}
+		if cpuScore != "" {
+			break
+		}
+	}
+
+	// Try to find memory score
+	for _, pattern := range memPatterns {
+		for _, score := range scores {
+			if score.Name == pattern {
+				memScore = score.Name
+				break
+			}
+		}
+		if memScore != "" {
+			break
+		}
+	}
+
+	return cpuScore, memScore
 }
 
 // GeneratePlacementParams represents parameters for generating placement
@@ -257,6 +305,49 @@ func (e *emptyPlacementDecisionNamespaceLister) Get(name string) (*clusterv1beta
 	return nil, fmt.Errorf("not found")
 }
 
+// directScoreLister implements AddOnPlacementScoreLister using direct API calls for dry run
+type directScoreLister struct {
+	client clusterclientset.Interface
+}
+
+func (d *directScoreLister) List(selector labels.Selector) (ret []*clusterv1alpha1.AddOnPlacementScore, err error) {
+	// For dry run, we don't need to list across all namespaces
+	return []*clusterv1alpha1.AddOnPlacementScore{}, nil
+}
+
+func (d *directScoreLister) AddOnPlacementScores(namespace string) clusterlisterv1alpha1.AddOnPlacementScoreNamespaceLister {
+	return &directScoreNamespaceLister{
+		client:    d.client,
+		namespace: namespace,
+	}
+}
+
+// directScoreNamespaceLister implements AddOnPlacementScoreNamespaceLister using direct API calls
+type directScoreNamespaceLister struct {
+	client    clusterclientset.Interface
+	namespace string
+}
+
+func (d *directScoreNamespaceLister) List(selector labels.Selector) (ret []*clusterv1alpha1.AddOnPlacementScore, err error) {
+	// Get all scores in the namespace
+	scores, err := d.client.ClusterV1alpha1().AddOnPlacementScores(d.namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*clusterv1alpha1.AddOnPlacementScore, len(scores.Items))
+	for i := range scores.Items {
+		result[i] = &scores.Items[i]
+	}
+	return result, nil
+}
+
+func (d *directScoreNamespaceLister) Get(name string) (*clusterv1alpha1.AddOnPlacementScore, error) {
+	return d.client.ClusterV1alpha1().AddOnPlacementScores(d.namespace).Get(context.Background(), name, metav1.GetOptions{})
+}
+
 // evaluateClusters filters and scores clusters based on placement spec using OCM scheduler
 func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placement *clusterv1beta1.Placement) []ClusterDecision {
 	// Convert []clusterv1.ManagedCluster to []*clusterv1.ManagedCluster for scheduler
@@ -285,10 +376,13 @@ func (h *Handler) evaluateClusters(clusters []clusterv1.ManagedCluster, placemen
 	// The taint toleration plugin requires a non-nil placementDecisionLister
 	emptyLister := &emptyPlacementDecisionLister{}
 
+	// Create direct score lister for accessing AddOnPlacementScore resources in dry run
+	scoreLister := &directScoreLister{client: h.ClusterClient}
+
 	handle := scheduling.NewSchedulerHandler(
 		h.ClusterClient,
 		emptyLister,     // Empty lister for dry run
-		nil,             // scoreLister - not needed for dry run without AddOn prioritizers
+		scoreLister,     // scoreLister - needed for AddOn prioritizers
 		nil,             // clusterLister - not needed, we already have the clusters
 		nil,             // eventsRecorder - not needed for dry run
 		metricsRecorder, // metricsRecorder - required to avoid nil pointer errors
@@ -713,19 +807,21 @@ func buildPrioritizers(req Requirements, scoreInfo *AddOnScoreInfo) []clusterv1b
 
 	// Add CPU prioritizer if weight > 0
 	if cpuWeight > 0 {
-		if useAddOnScores && scoreInfo.ScoreNames["cpuClusterAvailable"] {
+		if useAddOnScores && scoreInfo.CPUScoreName != "" {
 			// Use real-time CPU availability from AddOnPlacementScore
 			configs = append(configs, clusterv1beta1.PrioritizerConfig{
 				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
 					Type: clusterv1beta1.ScoreCoordinateTypeAddOn,
 					AddOn: &clusterv1beta1.AddOnScore{
 						ResourceName: scoreInfo.ResourceName,
-						ScoreName:    "cpuClusterAvailable",
+						ScoreName:    scoreInfo.CPUScoreName,
 					},
 				},
 				Weight: cpuWeight,
 			})
-			klog.V(4).InfoS("Using AddOn score for CPU prioritization", "scoreName", "cpuClusterAvailable")
+			klog.V(4).InfoS("Using AddOn score for CPU prioritization",
+				"resourceName", scoreInfo.ResourceName,
+				"scoreName", scoreInfo.CPUScoreName)
 		} else {
 			// Fallback to static allocatable CPU
 			configs = append(configs, clusterv1beta1.PrioritizerConfig{
@@ -741,19 +837,21 @@ func buildPrioritizers(req Requirements, scoreInfo *AddOnScoreInfo) []clusterv1b
 
 	// Add Memory prioritizer if weight > 0
 	if memoryWeight > 0 {
-		if useAddOnScores && scoreInfo.ScoreNames["memClusterAvailable"] {
+		if useAddOnScores && scoreInfo.MemScoreName != "" {
 			// Use real-time memory availability from AddOnPlacementScore
 			configs = append(configs, clusterv1beta1.PrioritizerConfig{
 				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
 					Type: clusterv1beta1.ScoreCoordinateTypeAddOn,
 					AddOn: &clusterv1beta1.AddOnScore{
 						ResourceName: scoreInfo.ResourceName,
-						ScoreName:    "memClusterAvailable",
+						ScoreName:    scoreInfo.MemScoreName,
 					},
 				},
 				Weight: memoryWeight,
 			})
-			klog.V(4).InfoS("Using AddOn score for memory prioritization", "scoreName", "memClusterAvailable")
+			klog.V(4).InfoS("Using AddOn score for memory prioritization",
+				"resourceName", scoreInfo.ResourceName,
+				"scoreName", scoreInfo.MemScoreName)
 		} else {
 			// Fallback to static allocatable memory
 			configs = append(configs, clusterv1beta1.PrioritizerConfig{
