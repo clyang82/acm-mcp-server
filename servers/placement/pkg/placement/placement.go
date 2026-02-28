@@ -45,6 +45,67 @@ func NewHandler(clusterClient clusterclientset.Interface) *Handler {
 	}
 }
 
+// AddOnScoreInfo represents information about available AddOnPlacementScore resources
+type AddOnScoreInfo struct {
+	HasScores    bool
+	ResourceName string
+	ScoreNames   map[string]bool // Map of score names that are available
+}
+
+// detectAddOnPlacementScores checks if AddOnPlacementScore resources exist with CPU and memory scores
+func (h *Handler) detectAddOnPlacementScores(ctx context.Context) *AddOnScoreInfo {
+	info := &AddOnScoreInfo{
+		HasScores:  false,
+		ScoreNames: make(map[string]bool),
+	}
+
+	// Get all managed clusters to check their namespaces for AddOnPlacementScore resources
+	clusters, err := h.ClusterClient.ClusterV1().ManagedClusters().List(ctx, metav1.ListOptions{
+		Limit: 1, // Just check one cluster to see if the score exists
+	})
+	if err != nil || len(clusters.Items) == 0 {
+		klog.V(4).InfoS("No clusters found or error listing clusters, using BuiltIn prioritizers", "error", err)
+		return info
+	}
+
+	// Check the first available cluster's namespace for AddOnPlacementScore
+	clusterNamespace := clusters.Items[0].Name
+
+	// Try common resource names
+	resourceNames := []string{"resource-usage-score", "default"}
+
+	for _, resourceName := range resourceNames {
+		score, err := h.ClusterClient.ClusterV1alpha1().AddOnPlacementScores(clusterNamespace).Get(ctx, resourceName, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+
+		// Check if the score has the metrics we're looking for
+		hasCPU := false
+		hasMem := false
+		for _, item := range score.Status.Scores {
+			if item.Name == "cpuClusterAvailable" {
+				hasCPU = true
+				info.ScoreNames["cpuClusterAvailable"] = true
+			}
+			if item.Name == "memClusterAvailable" {
+				hasMem = true
+				info.ScoreNames["memClusterAvailable"] = true
+			}
+		}
+
+		if hasCPU && hasMem {
+			info.HasScores = true
+			info.ResourceName = resourceName
+			klog.V(4).InfoS("Found AddOnPlacementScore with CPU and memory scores", "resourceName", resourceName, "namespace", clusterNamespace)
+			return info
+		}
+	}
+
+	klog.V(4).InfoS("No AddOnPlacementScore resources found with required scores, using BuiltIn prioritizers")
+	return info
+}
+
 // GeneratePlacementParams represents parameters for generating placement
 type GeneratePlacementParams struct {
 	Name        string `json:"name"`
@@ -90,6 +151,9 @@ func (h *Handler) GeneratePlacement(ctx context.Context, params GeneratePlacemen
 	// Parse the description to extract requirements
 	requirements := parseRequirements(params.Description)
 
+	// Detect AddOnPlacementScore resources for intelligent prioritizer selection
+	scoreInfo := h.detectAddOnPlacementScores(ctx)
+
 	// Build the Placement object
 	placement := &clusterv1beta1.Placement{
 		TypeMeta: metav1.TypeMeta{
@@ -100,7 +164,7 @@ func (h *Handler) GeneratePlacement(ctx context.Context, params GeneratePlacemen
 			Name:      params.Name,
 			Namespace: params.Namespace,
 		},
-		Spec: buildPlacementSpec(requirements),
+		Spec: buildPlacementSpec(requirements, scoreInfo),
 	}
 
 	// Convert to YAML
@@ -114,7 +178,7 @@ func (h *Handler) GeneratePlacement(ctx context.Context, params GeneratePlacemen
 
 // DryRunPlacement evaluates which clusters would be selected by a Placement without creating it
 func (h *Handler) DryRunPlacement(ctx context.Context, params DryRunPlacementParams) (*DryRunPlacementResult, error) {
-	placement, err := h.parsePlacementParams(params)
+	placement, err := h.parsePlacementParams(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +200,7 @@ func (h *Handler) DryRunPlacement(ctx context.Context, params DryRunPlacementPar
 }
 
 // parsePlacementParams parses DryRunPlacementParams into a Placement object
-func (h *Handler) parsePlacementParams(params DryRunPlacementParams) (*clusterv1beta1.Placement, error) {
+func (h *Handler) parsePlacementParams(ctx context.Context, params DryRunPlacementParams) (*clusterv1beta1.Placement, error) {
 	if params.PlacementYAML != "" {
 		placement := &clusterv1beta1.Placement{}
 		if err := yaml.Unmarshal([]byte(params.PlacementYAML), placement); err != nil {
@@ -155,12 +219,15 @@ func (h *Handler) parsePlacementParams(params DryRunPlacementParams) (*clusterv1
 			namespace = "default"
 		}
 
+		// Detect AddOnPlacementScore resources for intelligent prioritizer selection
+		scoreInfo := h.detectAddOnPlacementScores(ctx)
+
 		return &clusterv1beta1.Placement{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: namespace,
 			},
-			Spec: buildPlacementSpec(parseRequirements(params.Description)),
+			Spec: buildPlacementSpec(parseRequirements(params.Description), scoreInfo),
 		}, nil
 	}
 
@@ -568,7 +635,7 @@ func buildCELExpressions(req Requirements) []string {
 }
 
 // buildPlacementSpec builds a PlacementSpec from requirements
-func buildPlacementSpec(req Requirements) clusterv1beta1.PlacementSpec {
+func buildPlacementSpec(req Requirements, scoreInfo *AddOnScoreInfo) clusterv1beta1.PlacementSpec {
 	spec := clusterv1beta1.PlacementSpec{NumberOfClusters: req.NumberOfClusters}
 
 	predicate := clusterv1beta1.ClusterPredicate{
@@ -605,7 +672,8 @@ func buildPlacementSpec(req Requirements) clusterv1beta1.PlacementSpec {
 	}
 
 	// Add prioritizers based on parsed keywords
-	prioritizers := buildPrioritizers(req)
+	// Intelligently uses AddOn scores when available, falls back to BuiltIn scores
+	prioritizers := buildPrioritizers(req, scoreInfo)
 	if len(prioritizers) > 0 {
 		spec.PrioritizerPolicy = clusterv1beta1.PrioritizerPolicy{
 			Mode:           clusterv1beta1.PrioritizerPolicyModeExact,
@@ -617,7 +685,9 @@ func buildPlacementSpec(req Requirements) clusterv1beta1.PlacementSpec {
 }
 
 // buildPrioritizers creates prioritizer configurations based on requirements
-func buildPrioritizers(req Requirements) []clusterv1beta1.PrioritizerConfig {
+// It intelligently uses AddOnPlacementScore (real-time metrics) when available,
+// falling back to BuiltIn prioritizers (static capacity) when not available
+func buildPrioritizers(req Requirements, scoreInfo *AddOnScoreInfo) []clusterv1beta1.PrioritizerConfig {
 	var configs []clusterv1beta1.PrioritizerConfig
 
 	// Determine weights based on user intent
@@ -638,26 +708,63 @@ func buildPrioritizers(req Requirements) []clusterv1beta1.PrioritizerConfig {
 		memoryWeight = 5
 	}
 
+	// Choose between AddOn scores (real-time) and BuiltIn scores (static capacity)
+	useAddOnScores := scoreInfo != nil && scoreInfo.HasScores
+
 	// Add CPU prioritizer if weight > 0
 	if cpuWeight > 0 {
-		configs = append(configs, clusterv1beta1.PrioritizerConfig{
-			ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
-				Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
-				BuiltIn: "ResourceAllocatableCPU",
-			},
-			Weight: cpuWeight,
-		})
+		if useAddOnScores && scoreInfo.ScoreNames["cpuClusterAvailable"] {
+			// Use real-time CPU availability from AddOnPlacementScore
+			configs = append(configs, clusterv1beta1.PrioritizerConfig{
+				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+					Type: clusterv1beta1.ScoreCoordinateTypeAddOn,
+					AddOn: &clusterv1beta1.AddOnScore{
+						ResourceName: scoreInfo.ResourceName,
+						ScoreName:    "cpuClusterAvailable",
+					},
+				},
+				Weight: cpuWeight,
+			})
+			klog.V(4).InfoS("Using AddOn score for CPU prioritization", "scoreName", "cpuClusterAvailable")
+		} else {
+			// Fallback to static allocatable CPU
+			configs = append(configs, clusterv1beta1.PrioritizerConfig{
+				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+					Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
+					BuiltIn: "ResourceAllocatableCPU",
+				},
+				Weight: cpuWeight,
+			})
+			klog.V(4).InfoS("Using BuiltIn score for CPU prioritization", "scoreName", "ResourceAllocatableCPU")
+		}
 	}
 
 	// Add Memory prioritizer if weight > 0
 	if memoryWeight > 0 {
-		configs = append(configs, clusterv1beta1.PrioritizerConfig{
-			ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
-				Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
-				BuiltIn: "ResourceAllocatableMemory",
-			},
-			Weight: memoryWeight,
-		})
+		if useAddOnScores && scoreInfo.ScoreNames["memClusterAvailable"] {
+			// Use real-time memory availability from AddOnPlacementScore
+			configs = append(configs, clusterv1beta1.PrioritizerConfig{
+				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+					Type: clusterv1beta1.ScoreCoordinateTypeAddOn,
+					AddOn: &clusterv1beta1.AddOnScore{
+						ResourceName: scoreInfo.ResourceName,
+						ScoreName:    "memClusterAvailable",
+					},
+				},
+				Weight: memoryWeight,
+			})
+			klog.V(4).InfoS("Using AddOn score for memory prioritization", "scoreName", "memClusterAvailable")
+		} else {
+			// Fallback to static allocatable memory
+			configs = append(configs, clusterv1beta1.PrioritizerConfig{
+				ScoreCoordinate: &clusterv1beta1.ScoreCoordinate{
+					Type:    clusterv1beta1.ScoreCoordinateTypeBuiltIn,
+					BuiltIn: "ResourceAllocatableMemory",
+				},
+				Weight: memoryWeight,
+			})
+			klog.V(4).InfoS("Using BuiltIn score for memory prioritization", "scoreName", "ResourceAllocatableMemory")
+		}
 	}
 
 	// Add Steady prioritizer if any resource prioritizers were added
