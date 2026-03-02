@@ -224,6 +224,28 @@ func (s *MCPServer) handleToolsList(ctx context.Context, id interface{}) MCPResp
 				},
 			},
 		},
+		{
+			Name:        "generate_placement_from_vm",
+			Description: "Generate an OCM Placement YAML from a KubeVirt VirtualMachine YAML. Extracts resource requirements (CPU, memory), node selectors, and anti-affinity rules to create an intelligent placement that selects the best cluster(s) for the VM workload.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"vmYAML": map[string]interface{}{
+						"type":        "string",
+						"description": "KubeVirt VirtualMachine YAML specification",
+					},
+					"name": map[string]interface{}{
+						"type":        "string",
+						"description": "Name of the Placement resource to generate",
+					},
+					"namespace": map[string]interface{}{
+						"type":        "string",
+						"description": "Namespace for the Placement resource",
+					},
+				},
+				"required": []string{"vmYAML", "name", "namespace"},
+			},
+		},
 	}
 
 	result, _ := json.Marshal(map[string]interface{}{"tools": tools})
@@ -261,6 +283,8 @@ func (s *MCPServer) handleToolsCall(ctx context.Context, id interface{}, params 
 		return s.generatePlacement(ctx, id, toolCall.Arguments)
 	case "dryrun_placement":
 		return s.dryrunPlacement(ctx, id, toolCall.Arguments)
+	case "generate_placement_from_vm":
+		return s.generatePlacementFromVM(ctx, id, toolCall.Arguments)
 	default:
 		return MCPResponse{
 			JSONRPC: "2.0",
@@ -437,6 +461,66 @@ func (s *MCPServer) dryrunPlacement(ctx context.Context, id interface{}, argumen
 	}
 
 	result, _ := placement.MarshalResult(dryRunResult)
+
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
+}
+
+// generatePlacementFromVM generates a Placement YAML from a VirtualMachine YAML
+func (s *MCPServer) generatePlacementFromVM(ctx context.Context, id interface{}, arguments json.RawMessage) MCPResponse {
+	var params placement.VMPlacementParams
+	if err := json.Unmarshal(arguments, &params); err != nil {
+		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Error: &MCPError{
+				Code:    -32602,
+				Message: fmt.Sprintf("Invalid arguments: %v", err),
+			},
+		}
+	}
+
+	yamlOutput, err := s.placementHandler.GeneratePlacementFromVM(ctx, params)
+	if err != nil {
+		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Error: &MCPError{
+				Code:    -32603,
+				Message: err.Error(),
+			},
+		}
+	}
+
+	// Automatically perform a dry run with the generated placement
+	dryRunParams := placement.DryRunPlacementParams{
+		PlacementYAML: yamlOutput,
+	}
+	dryRunResult, err := s.placementHandler.DryRunPlacement(ctx, dryRunParams)
+	if err != nil {
+		// If dry run fails, still return the YAML but with a warning
+		result, _ := placement.MarshalResult(map[string]interface{}{
+			"yaml":          yamlOutput,
+			"dryRunError":   err.Error(),
+			"dryRunWarning": "Placement YAML generated successfully, but dry run failed",
+		})
+		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Result:  result,
+		}
+	}
+
+	// Return both the YAML and the dry run results
+	result, _ := placement.MarshalResult(map[string]interface{}{
+		"yaml":         yamlOutput,
+		"decisions":    dryRunResult.Decisions,
+		"totalMatched": dryRunResult.TotalMatched,
+		"summary":      dryRunResult.Summary,
+	})
 
 	return MCPResponse{
 		JSONRPC: "2.0",
